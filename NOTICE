@@ -1,0 +1,30 @@
+aaoo.textengine-go
+Copyright (c) 2026 Anael Orlinski
+
+The whole module is under the MIT license, see LICENSE. It contains code
+copied from, or written after, the following MIT-licensed projects:
+
+  github.com/tdewolff/font      Copyright (c) 2024 Taco de Wolff
+      sfnt/: the SFNT reader and writer, the glyf and CFF tables, the
+      subsetter, WOFF and WOFF2, by way of the fork
+      github.com/anaelorlinski/font, which added the CFF desubroutinizer and
+      the OpenType feature queries.
+
+  github.com/tdewolff/parse     Copyright (c) 2015 Taco de Wolff
+      internal/bin/: the binary readers and writers (binary.go).
+
+  github.com/tdewolff/canvas    Copyright (c) 2015 Taco de Wolff
+      glyph/: the synthetic italic and bold constants, the decoration
+      fallbacks and the vertical grid snap follow font.go, by way of the fork
+      github.com/anaelorlinski/tdewolff-canvas.
+      caps/: the sizes of simulated small and petite capitals are those of
+      text.go in the same fork.
+
+Test data, not part of the library:
+
+  sfnt/resources/DejaVuSerif.*           Bitstream Vera license, with the
+                                         DejaVu changes in the public domain
+  sfnt/resources/EBGaramond12-Regular.otf   SIL Open Font License 1.1
+  sfnt/resources/AdobeVFPrototype.otf       SIL Open Font License 1.1
+  sfnt/testdata/woff_format, woff2_*     W3C WOFF and WOFF2 test suites,
+                                         W3C 3-clause BSD license
