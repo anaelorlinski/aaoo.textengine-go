@@ -334,6 +334,14 @@ func (r *BinaryReader) ReadAt(b []byte, off int64) (int, error) {
 func (r *BinaryReader) ReadBytes(n int64) []byte {
 	data, err := r.f.Bytes(nil, n, r.pos)
 	r.pos += int64(len(data))
+	if int64(len(data)) < n {
+		// A short read gives nothing: the callers take a nil result for the
+		// end of the data, and index the bytes they asked for otherwise.
+		if err == nil {
+			err = io.EOF
+		}
+		data = nil
+	}
 	if r.err == nil {
 		r.err = err
 	}
@@ -557,7 +565,7 @@ func (r *BitmapReader) EOF() bool {
 
 // Read reads the next bit.
 func (r *BitmapReader) Read() bool {
-	if r.eof || uint32(len(r.buf)) <= (r.pos+1)/8 {
+	if r.eof || uint32(len(r.buf)) <= r.pos/8 {
 		r.eof = true
 		return false
 	}

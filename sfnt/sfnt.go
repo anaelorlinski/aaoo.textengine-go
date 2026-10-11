@@ -166,7 +166,9 @@ func (sfnt *SFNT) VerticalMetrics() (uint16, uint16, uint16) {
 	} else {
 		if sfnt.OS2.UsWinAscent != 0 && sfnt.OS2.UsWinDescent != 0 {
 			ascender, descender = sfnt.OS2.UsWinAscent, sfnt.OS2.UsWinDescent
-			externalLeading := int(sfnt.Hhea.Ascender-sfnt.Hhea.Descender+sfnt.Hhea.LineGap) - int(sfnt.OS2.UsWinAscent+sfnt.OS2.UsWinDescent)
+			// in int: the Windows values are unsigned, and a font that stores
+			// a negative descent there makes their sum pass 65535
+			externalLeading := int(sfnt.Hhea.Ascender) - int(sfnt.Hhea.Descender) + int(sfnt.Hhea.LineGap) - int(sfnt.OS2.UsWinAscent) - int(sfnt.OS2.UsWinDescent)
 			if 0 < externalLeading {
 				lineGap = uint16(externalLeading)
 			} else {
@@ -306,14 +308,12 @@ func parseSFNT(b []byte, index int, embedded bool) (*SFNT, error) {
 		}
 
 		_ = r.ReadBytes(int64(4 * index))
+		// The offset is the one of the table directory of the font. The
+		// tables themselves are anywhere in the file, shared between the
+		// fonts or not, and each is checked against the file below: a font
+		// has no extent of its own to check here.
 		offset := r.ReadUint32()
-		var length uint32
-		if uint32(index)+1 == numFonts {
-			length = uint32(len(b)) - offset
-		} else {
-			length = r.ReadUint32() - offset
-		}
-		if uint32(len(b))-8 < offset || uint32(len(b))-8-offset < length {
+		if uint32(len(b)) < 12 || uint32(len(b))-12 < offset {
 			return nil, ErrInvalidFontData
 		}
 
@@ -340,8 +340,9 @@ func parseSFNT(b []byte, index int, embedded bool) (*SFNT, error) {
 		offset := r.ReadUint32()
 		length := r.ReadUint32()
 
-		padding := (4 - length&3) & 3
-		if uint32(len(b)) <= offset || uint32(len(b))-offset < length || uint32(len(b))-offset-length < padding {
+		// a table is padded to four bytes, but the last one of a file often
+		// is not: only the table itself has to be there
+		if uint32(len(b)) < offset || uint32(len(b))-offset < length {
 			return nil, ErrInvalidFontData
 		}
 
@@ -456,14 +457,31 @@ func parseSFNT(b []byte, index int, embedded bool) (*SFNT, error) {
 			err = sfnt.parseHhea()
 		case "hmtx":
 			err = sfnt.parseHmtx()
+		// The tables below describe the font or adjust its text, and its
+		// glyphs can be drawn and embedded without them. One that cannot be
+		// read (an Apple kerning table, glyph names that do not match) is
+		// dropped, instead of the font being refused: the font is then one
+		// that does not have the table.
 		case "kern":
-			err = sfnt.parseKern()
+			if sfnt.parseKern() != nil {
+				sfnt.Kern = nil
+				delete(sfnt.Tables, tag)
+			}
 		case "name":
-			err = sfnt.parseName()
+			if sfnt.parseName() != nil {
+				sfnt.Name = &nameTable{}
+				delete(sfnt.Tables, tag)
+			}
 		case "OS/2":
-			err = sfnt.parseOS2()
+			if sfnt.parseOS2() != nil {
+				sfnt.OS2 = &os2Table{}
+				delete(sfnt.Tables, tag)
+			}
 		case "post":
-			err = sfnt.parsePost()
+			if sfnt.parsePost() != nil {
+				sfnt.Post = &postTable{}
+				delete(sfnt.Tables, tag)
+			}
 		case "vhea":
 			err = sfnt.parseVhea()
 		case "vmtx":
@@ -516,7 +534,7 @@ func (sfnt *SFNT) Write() []byte {
 			w.WriteBytes(table[:8])
 			w.WriteUint32(0)
 			w.WriteBytes(table[12:28])
-			w.WriteInt64(int64(time.Now().UTC().Sub(time.Date(1904, 1, 1, 0, 0, 0, 0, time.UTC)) / 1e9)) // modified
+			w.WriteBytes(table[28:36]) // modified: kept, so that a font is written the same every time
 			w.WriteBytes(table[36:])
 		} else {
 			w.WriteBytes(table)
@@ -583,8 +601,11 @@ func (sfnt *SFNT) parseHead() error {
 	sfnt.Head.UnitsPerEm = r.ReadUint16()
 	created := r.ReadUint64()
 	modified := r.ReadUint64()
-	if math.MaxInt64 < created || math.MaxInt64 < modified {
-		return fmt.Errorf("head: created and/or modified dates too large")
+	if math.MaxInt64/uint64(time.Second) < created {
+		created = 0 // a date that makes no sense is not a reason to refuse the font
+	}
+	if math.MaxInt64/uint64(time.Second) < modified {
+		modified = 0
 	}
 	sfnt.Head.Created = time.Date(1904, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Second * time.Duration(created))
 	sfnt.Head.Modified = time.Date(1904, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Second * time.Duration(modified))
@@ -733,7 +754,12 @@ type hmtxTable struct {
 
 func (hmtx *hmtxTable) LeftSideBearing(glyphID uint16) int16 {
 	if uint16(len(hmtx.HMetrics)) <= glyphID {
-		return hmtx.LeftSideBearings[glyphID-uint16(len(hmtx.HMetrics))]
+		i := int(glyphID) - len(hmtx.HMetrics)
+		if len(hmtx.LeftSideBearings) <= i {
+			// a glyph the table does not know
+			return 0
+		}
+		return hmtx.LeftSideBearings[i]
 	}
 	return hmtx.HMetrics[glyphID].LeftSideBearing
 }
@@ -861,6 +887,9 @@ func (sfnt *SFNT) parseMaxp() error {
 		return fmt.Errorf("maxp: missing table")
 	}
 
+	if len(b) < 6 {
+		return fmt.Errorf("maxp: bad table")
+	}
 	sfnt.Maxp = &maxpTable{}
 	r := bin.NewBinaryReaderBytes(b)
 	sfnt.Maxp.Version = binary.BigEndian.Uint32(r.ReadBytes(4))

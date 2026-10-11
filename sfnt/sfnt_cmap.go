@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 
@@ -176,70 +177,29 @@ func (subtable *cmapFormat14) ToUnicode(glyphID uint16) []rune {
 }
 
 func cmapWriteFormat4(w *bin.BinaryWriter, rs []rune, runeMap map[rune]uint16) {
-	// rs is sorted
+	// rs is sorted and holds each rune once.
+	//
+	// One segment for each run of consecutive characters whose glyphs are
+	// consecutive too, each mapped by a delta: a subset has few glyphs, and
+	// the glyphs of a run of characters mostly follow one another.
 	data := cmapFormat4{}
-	addSegment := func(firstCode, lastCode rune, glyphIDs []uint16, contiguous bool) {
+	addSegment := func(firstCode, lastCode rune, firstGlyph uint16) {
 		data.EndCode = append(data.EndCode, uint16(lastCode))
 		data.StartCode = append(data.StartCode, uint16(firstCode))
-		if contiguous {
-			// use idDelta
-			firstGlyph := glyphIDs[0]
-			delta := int(firstGlyph) - int(firstCode)
-			if math.MaxInt16 < delta {
-				delta -= 65536
-			} else if delta < math.MinInt16 {
-				delta += 65536
-			}
-			data.IdDelta = append(data.IdDelta, int16(delta))
-			data.IdRangeOffset = append(data.IdRangeOffset, 0)
-		} else {
-			// use idRangeOffset
-			// set the value of IdRangeOffset to the offset in GlyphIdArray, updated below
-			data.IdDelta = append(data.IdDelta, 0)
-			data.IdRangeOffset = append(data.IdRangeOffset, uint16(len(data.GlyphIdArray)))
-			data.GlyphIdArray = append(data.GlyphIdArray, glyphIDs...)
-		}
+		// the glyph is the code plus the delta, modulo 65536
+		data.IdDelta = append(data.IdDelta, int16(firstGlyph-uint16(firstCode)))
+		data.IdRangeOffset = append(data.IdRangeOffset, 0)
 	}
-
-	i0 := 0
-	glyphIDs := []uint16{runeMap[rs[0]]}
+	first := 0
 	for i := 1; i <= len(rs); i++ {
-		if i < len(rs) && rs[i] == rs[i-1] {
+		if i < len(rs) && rs[i] == rs[i-1]+1 && runeMap[rs[i]] == runeMap[rs[i-1]]+1 {
 			continue
-		} else if i == len(rs) || rs[i-1]+1 != rs[i] {
-			// Find subsets of glyphIDs that are contiguous for at least 9 glyphs in a row.
-			// Track index before which is already written as segment (j0) and track index
-			// before which glyph indices are not contiguous (jc). Write a new segments whenever we
-			// encounter a non-contiguous glyph ID (and writing a separate segment for the
-			// contiguous glyph IDs beforehand is worthwhile) or end-of-array. We have a stretch
-			// of non-contiguous glyph IDs followed by contiguous, one may be empty.
-			j0, jc := 0, 0
-			for j := 1; j <= len(glyphIDs); j++ {
-				if j == len(glyphIDs) || glyphIDs[j-1]+1 != glyphIDs[j] && 8 < j-jc {
-					if 8 < j-jc && j0 != jc {
-						addSegment(rs[i0+j0], rs[i0+(jc-1)], glyphIDs[j0:jc], false)
-						addSegment(rs[i0+jc], rs[i0+(j-1)], glyphIDs[jc:j], true)
-						j0, jc = j, j
-					} else if j == len(glyphIDs) {
-						addSegment(rs[i0+j0], rs[i0+(j-1)], glyphIDs[j0:j], j0 == jc)
-					}
-					if j == len(glyphIDs) {
-						break
-					}
-				} else if glyphIDs[j-1]+1 != glyphIDs[j] {
-					jc = j
-				}
-			}
-			if i == len(rs) {
-				break
-			}
-			glyphIDs = glyphIDs[:0]
-			i0 = i
 		}
-		glyphIDs = append(glyphIDs, runeMap[rs[i]])
+		addSegment(rs[first], rs[i-1], runeMap[rs[first]])
+		first = i
 	}
 	if rs[len(rs)-1] != 0xFFFF {
-		addSegment(0xFFFF, 0xFFFF, []uint16{0}, true) // map to .notdef
+		addSegment(0xFFFF, 0xFFFF, 0) // the last segment, mapped to .notdef
 	}
 
 	start := w.Len()
@@ -265,16 +225,8 @@ func cmapWriteFormat4(w *bin.BinaryWriter, rs []rune, runeMap map[rune]uint16) {
 	for _, idDelta := range data.IdDelta {
 		w.WriteInt16(idDelta)
 	}
-	for i, idRangeOffset := range data.IdRangeOffset {
-		if data.IdDelta[i] != 0 {
-			w.WriteUint16(0)
-		} else {
-			glyphIdArrayStart := uint16(len(data.IdRangeOffset) - i)
-			w.WriteUint16((glyphIdArrayStart + idRangeOffset) * 2) // times 2 since entries are 16 bit
-		}
-	}
-	for _, glyphID := range data.GlyphIdArray {
-		w.WriteUint16(glyphID)
+	for range data.IdRangeOffset {
+		w.WriteUint16(0) // every segment maps by its delta
 	}
 
 	// TODO: subtable may exceed the range of the length field (16 bits, or 65536 bytes long)
@@ -323,7 +275,10 @@ func cmapWrite(rs []rune, runeMap map[rune]uint16) []byte {
 		return []byte{0x00, 0x00, 0x00, 0x00}
 	}
 
+	// each rune once, in order: several glyphs of a font may stand for one
+	// character, and the map keeps one of them
 	sort.Slice(rs, func(i, j int) bool { return rs[i] < rs[j] })
+	rs = slices.Compact(rs)
 
 	// TODO: it may be more efficient to have several tables of different formats
 	w := bin.NewBinaryWriter([]byte{})
@@ -371,11 +326,38 @@ type cmapSubtable interface {
 type cmapTable struct {
 	EncodingRecords []cmapEncodingRecord
 	Subtables       []cmapSubtable
+
+	unicode []cmapSubtable // see unicodeSubtables
+	once    sync.Once
 }
 
-// Get returns the glyph ID for the corresponding rune. It looks for each subtable in the order in which they appear and returns the first match, or 0 when no match is found.
+// unicodeSubtables returns the subtables whose character codes are Unicode:
+// those of the Unicode platform, and of the Windows platform for its Unicode
+// and symbol encodings. The codes of a Macintosh subtable are those of Mac
+// Roman or of another script, which are not Unicode past ASCII.
+//
+// A font with no Unicode subtable gives all it has: its codes are then the
+// best there is.
+func (cmap *cmapTable) unicodeSubtables() []cmapSubtable {
+	cmap.once.Do(func() {
+		seen := map[uint16]bool{}
+		for _, record := range cmap.EncodingRecords {
+			unicode := record.PlatformID == 0 || record.PlatformID == 3 && (record.EncodingID == 0 || record.EncodingID == 1 || record.EncodingID == 10)
+			if unicode && !seen[record.Subtable] && int(record.Subtable) < len(cmap.Subtables) {
+				seen[record.Subtable] = true
+				cmap.unicode = append(cmap.unicode, cmap.Subtables[record.Subtable])
+			}
+		}
+		if len(cmap.unicode) == 0 {
+			cmap.unicode = cmap.Subtables
+		}
+	})
+	return cmap.unicode
+}
+
+// Get returns the glyph ID for the corresponding rune. It looks for each Unicode subtable in the order in which they appear and returns the first match, or 0 when no match is found.
 func (cmap *cmapTable) Get(r rune) uint16 {
-	for _, subtable := range cmap.Subtables {
+	for _, subtable := range cmap.unicodeSubtables() {
 		if glyphID, ok := subtable.Get(r); ok {
 			return glyphID
 		}
@@ -383,10 +365,10 @@ func (cmap *cmapTable) Get(r rune) uint16 {
 	return 0
 }
 
-// ToUnicode returns all runes for the corresponding glyph ID. It looks for each subtable in the order in which they appear and returns referenced runes for the glyph ID, or nil if none.
+// ToUnicode returns all runes for the corresponding glyph ID. It looks for each Unicode subtable in the order in which they appear and returns referenced runes for the glyph ID, or nil if none.
 func (cmap *cmapTable) ToUnicode(glyphID uint16) []rune {
 	var rs []rune
-	for _, subtable := range cmap.Subtables {
+	for _, subtable := range cmap.unicodeSubtables() {
 	AppendLoop:
 		for _, r := range subtable.ToUnicode(glyphID) {
 			for _, r2 := range rs {
@@ -399,6 +381,13 @@ func (cmap *cmapTable) ToUnicode(glyphID uint16) []rune {
 	}
 	return rs
 }
+
+// cmapUnsupported stands for a subtable in a format that is not read: it
+// maps nothing. A font is not refused for one of its subtables.
+type cmapUnsupported struct{}
+
+func (cmapUnsupported) Get(rune) (uint16, bool) { return 0, false }
+func (cmapUnsupported) ToUnicode(uint16) []rune { return nil }
 
 func (sfnt *SFNT) parseCmap() error {
 	if sfnt.Maxp == nil {
@@ -463,6 +452,9 @@ func (sfnt *SFNT) parseCmap() error {
 			} else if offset <= offsets[i] && offsets[i] < offset+length {
 				return fmt.Errorf("cmap: bad subtable %d", j)
 			}
+		}
+		if uint32(len(b)) < offset+length || length < uint32(rs.Pos()) {
+			return fmt.Errorf("cmap: bad subtable %d", j)
 		}
 		rs = bin.NewBinaryReaderBytes(b[offset+uint32(rs.Pos()) : offset+length])
 
@@ -645,7 +637,9 @@ func (sfnt *SFNT) parseCmap() error {
 				//	}
 				//}
 			default:
-				return fmt.Errorf("cmap: unsupported subtable format %d", format)
+				// formats 2, 8, 10 and 13: not read, and not a reason to
+				// refuse the font
+				sfnt.Cmap.Subtables = append(sfnt.Cmap.Subtables, cmapUnsupported{})
 			}
 		}
 		sfnt.Cmap.EncodingRecords = append(sfnt.Cmap.EncodingRecords, cmapEncodingRecord{

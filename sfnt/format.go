@@ -22,7 +22,7 @@ func MediaType(b []byte) (string, error) {
 		return "font/truetype", nil
 	} else if tag == "OTTO" {
 		return "font/opentype", nil
-	} else if 36 < len(b) && binary.LittleEndian.Uint16(b[34:36]) == 0x504C {
+	} else if 36 <= len(b) && binary.LittleEndian.Uint16(b[34:36]) == 0x504C {
 		return "application/vnd.ms-fontobject", nil
 	}
 	return "", fmt.Errorf("unrecognized font file format")

@@ -1,8 +1,11 @@
 package glyph
 
 import (
+	"fmt"
 	"math"
 	"os"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/anaelorlinski/aaoo.textengine-go/face"
@@ -47,12 +50,12 @@ func load(t *testing.T, name string) (*face.Face, *sfnt.SFNT) {
 	return f, s
 }
 
-// The go-text reader and the sfnt reader must agree on where a glyph is: the
-// first draws what the second embeds.
-func TestOutlineBoundsAgreeWithSFNT(t *testing.T) {
+// The go-text reader and the sfnt reader must agree on which glyph a
+// character is and on how far it advances: the first draws what the second
+// embeds.
+func TestGlyphsAndAdvancesAgreeWithSFNT(t *testing.T) {
 	for _, name := range []string{"DejaVuSerif.ttf", "EBGaramond12-Regular.otf"} {
 		f, s := load(t, name)
-		upem := float64(f.UnitsPerEm())
 		for _, r := range "AgQ&é@fi§" {
 			gid, ok := f.GlyphIndex(r)
 			if !ok {
@@ -64,21 +67,175 @@ func TestOutlineBoundsAgreeWithSFNT(t *testing.T) {
 			if a, b := float64(f.Advance(gid)), float64(s.GlyphAdvance(uint16(gid))); a != b {
 				t.Errorf("%s %q: advance %v from go-text, %v from sfnt", name, r, a, b)
 			}
-			got, ok := FromFace(f, gid, upem, Style{})
-			if !ok {
-				t.Fatalf("%s %q: no outline", name, r)
+		}
+	}
+}
+
+// edge is one step of a closed contour: its kind, control points and end.
+type edge struct {
+	op  Op
+	pts []Point
+}
+
+func (e edge) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d", e.op)
+	for _, p := range e.pts {
+		fmt.Fprintf(&b, " %.3f,%.3f", p.X, p.Y)
+	}
+	return b.String()
+}
+
+// near allows the rounding of 16.16 fixed-point coordinates to float32.
+func nearPoint(a, b Point) bool {
+	return math.Abs(a.X-b.X) < 2e-3 && math.Abs(a.Y-b.Y) < 2e-3
+}
+
+// contours splits an outline into closed contours in a canonical form: a
+// zero-length line and a closing line back to the start are dropped, and
+// each contour is rotated to start at its smallest edge, so that two readers
+// that start a contour at different points, or close it differently, still
+// compare equal.
+func contours(o Outline) [][]edge {
+	var out [][]edge
+	var cur []edge
+	var start Point
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		last := cur[len(cur)-1]
+		if last.op == LineTo && len(cur) > 1 && nearPoint(last.pts[0], start) {
+			cur = cur[:len(cur)-1]
+		}
+		best := 0
+		for i := range cur {
+			if cur[i].String() < cur[best].String() {
+				best = i
 			}
-			var rec recorder
-			if err := s.GlyphPath(&rec, uint16(gid), 0, 0, 0, 1, sfnt.NoHinting); err != nil {
-				t.Fatal(err)
-			}
-			gx0, gy0, gx1, gy1, _ := got.Bounds()
-			wx0, wy0, wx1, wy1, _ := rec.out.Bounds()
-			for i, d := range []float64{gx0 - wx0, gy0 - wy0, gx1 - wx1, gy1 - wy1} {
-				if math.Abs(d) > 1 { // one font unit: the readers round differently
-					t.Errorf("%s %q: bound %d differs by %v units", name, r, i, d)
+		}
+		out = append(out, append(append([]edge{}, cur[best:]...), cur[:best]...))
+		cur = nil
+	}
+	for _, s := range o {
+		switch s.Op {
+		case MoveTo:
+			flush()
+			start = s.P[0]
+		default:
+			if s.Op == LineTo {
+				prev := start
+				if len(cur) > 0 {
+					p := cur[len(cur)-1].pts
+					prev = p[len(p)-1]
+				}
+				if nearPoint(s.P[0], prev) {
+					continue
 				}
 			}
+			cur = append(cur, edge{op: s.Op, pts: append([]Point(nil), s.Points()...)})
+		}
+	}
+	flush()
+	sort.Slice(out, func(i, j int) bool { return out[i][0].String() < out[j][0].String() })
+	return out
+}
+
+// sameContours compares two canonical outlines point by point.
+func sameContours(a, b [][]edge) string {
+	if len(a) != len(b) {
+		return fmt.Sprintf("%d contours from go-text, %d from sfnt", len(a), len(b))
+	}
+	for i := range a {
+		if len(a[i]) != len(b[i]) {
+			return fmt.Sprintf("contour %d: %d edges from go-text, %d from sfnt", i, len(a[i]), len(b[i]))
+		}
+		for j := range a[i] {
+			ea, eb := a[i][j], b[i][j]
+			if ea.op != eb.op || len(ea.pts) != len(eb.pts) {
+				return fmt.Sprintf("contour %d edge %d: %s from go-text, %s from sfnt", i, j, ea, eb)
+			}
+			for k := range ea.pts {
+				if !nearPoint(ea.pts[k], eb.pts[k]) {
+					return fmt.Sprintf("contour %d edge %d: %s from go-text, %s from sfnt", i, j, ea, eb)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// exactDiff reports the first difference in the raw segment lists.
+func exactDiff(a, b Outline) string {
+	if len(a) != len(b) {
+		return fmt.Sprintf("%d segments from go-text, %d from sfnt", len(a), len(b))
+	}
+	for i := range a {
+		if a[i].Op != b[i].Op {
+			return fmt.Sprintf("segment %d: op %d from go-text, %d from sfnt", i, a[i].Op, b[i].Op)
+		}
+		pa, pb := a[i].Points(), b[i].Points()
+		for j := range pa {
+			if !nearPoint(pa[j], pb[j]) {
+				return fmt.Sprintf("segment %d point %d: %v from go-text, %v from sfnt", i, j, pa[j], pb[j])
+			}
+		}
+	}
+	return ""
+}
+
+// The two readers of the module must draw the same outline for every glyph:
+// the same segment kinds through the same points, contour by contour. Bounding
+// boxes alone would let a wrong segment kind or a dropped inner contour pass.
+//
+// go-text, like FreeType and HarfBuzz, moves a TrueType glyph so that its
+// left side bearing is the one of hmtx; the sfnt package gives the raw
+// coordinates. The sfnt outline is moved by the same amount before the
+// comparison: DejaVu Serif has 33 glyphs whose hmtx and glyf disagree by one
+// unit.
+func TestOutlineAgreesWithSFNT(t *testing.T) {
+	for _, name := range []string{"DejaVuSerif.ttf", "EBGaramond12-Regular.otf"} {
+		f, s := load(t, name)
+		upem := float64(f.UnitsPerEm())
+		n := int(s.NumGlyphs())
+		exact, differ, empty, shifted := 0, 0, 0, 0
+		for gid := 0; gid < n; gid++ {
+			got, ok := FromFace(f, face.GID(gid), upem, Style{})
+			var rec recorder
+			if err := s.GlyphPath(&rec, uint16(gid), 0, 0, 0, 1, sfnt.NoHinting); err != nil {
+				t.Errorf("%s glyph %d: sfnt: %v", name, gid, err)
+				continue
+			}
+			if !ok {
+				if len(rec.out) != 0 {
+					t.Errorf("%s glyph %d: go-text gives no outline, sfnt gives %d segments", name, gid, len(rec.out))
+				}
+				empty++
+				continue
+			}
+			if s.IsTrueType {
+				xMin, _, _, _ := s.GlyphBounds(uint16(gid))
+				if dx := float64(s.Hmtx.LeftSideBearing(uint16(gid)) - xMin); dx != 0 {
+					shifted++
+					rec.out = rec.out.Apply(Transform{A: 1, D: 1, E: dx})
+				}
+			}
+			if d := exactDiff(got, rec.out); d != "" {
+				exact++
+				if exact <= 3 {
+					t.Logf("%s glyph %d: raw segments differ: %s", name, gid, d)
+				}
+			}
+			if d := sameContours(contours(got), contours(rec.out)); d != "" {
+				differ++
+				if differ <= 5 {
+					t.Errorf("%s glyph %d: outlines differ: %s", name, gid, d)
+				}
+			}
+		}
+		t.Logf("%s: %d glyphs, %d without outline, %d moved by the side bearing, %d differ in raw segments, %d differ once canonical", name, n, empty, shifted, exact, differ)
+		if differ > 0 {
+			t.Errorf("%s: %d of %d glyphs differ between go-text and sfnt", name, differ, n)
 		}
 	}
 }

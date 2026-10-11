@@ -61,8 +61,9 @@ func Parse(data []byte, index int) (*Face, error) {
 // it is not read again: data is the file ft comes from and index its index
 // in it. The face shares the variation settings of ft.
 //
-// The vertical metrics and the embedding need data to be the right file:
-// with other bytes, Vertical is zero and Embed fails.
+// The vertical metrics and the embedding are read from data, which must be
+// the file of ft: without it, Vertical is zero and Embed fails. The bytes of
+// another font are not detected: they would be embedded in its place.
 func FromGoText(ft *font.Face, data []byte, index int) *Face {
 	var ld *ot.Loader
 	if plain, err := sfnt.ToSFNT(data); err == nil {
@@ -115,6 +116,27 @@ func (f *Face) GoText() *font.Face { return f.ft }
 // be modified.
 func (f *Face) Data() []byte { return f.data }
 
+// File identifies the font file a face comes from, and the font in it: two
+// faces of the same File are the same font program, which an output embeds
+// once. It is comparable, to serve as a map key.
+//
+// Faces share a File when they were made from the same bytes in memory, as
+// the faces a Collection gives for one file are, whatever the families and
+// the styles the file was added under.
+type File struct {
+	first *byte
+	size  int
+	index int
+}
+
+// File returns the identity of the font file of the face.
+func (f *Face) File() File {
+	if len(f.data) == 0 {
+		return File{}
+	}
+	return File{first: &f.data[0], size: len(f.data), index: f.index}
+}
+
 // Index returns the index of the face in its file.
 func (f *Face) Index() int { return f.index }
 
@@ -163,7 +185,9 @@ func (f *Face) Metrics(rule VerticalRule) Metrics {
 		StrikethroughPosition:  f.ft.LineMetric(font.StrikethroughPosition),
 		StrikethroughThickness: f.ft.LineMetric(font.StrikethroughThickness),
 	}
-	if rule == MicrosoftRule {
+	// A face without its file (see FromGoText) has no tables to read the
+	// other values from: the ones of go-text are then kept.
+	if rule == MicrosoftRule && f.vert != (Vertical{}) {
 		ascent, descent, lineGap := f.vert.Resolve(rule)
 		out.Ascent, out.Descent, out.LineGap = ascent, -descent, lineGap
 	}
@@ -195,12 +219,16 @@ type Embedded struct {
 	// they are CFF.
 	TrueType bool
 	// Glyphs are the glyphs of Program in order: the glyph at position i of
-	// Program is Glyphs[i] of the original font. Glyphs[0] is always 0.
+	// Program is Glyphs[i] of the original font. Glyphs[0] is always 0, the
+	// glyphs asked for follow in the order they were given, and after them
+	// come the glyphs they are composed of, which nobody asked for.
 	Glyphs []uint16
 	// Advances are the horizontal advances of Glyphs, in font units.
 	Advances []uint16
-	// Runes are the characters Glyphs stand for, as the font maps them: the
-	// first one of each glyph, and 0 for a glyph no character maps to.
+	// Runes are the characters Glyphs stand for, as the Unicode tables of
+	// the font map them: one for each glyph, a control or private-use code
+	// only when the font gives nothing else, and 0 for a glyph no character
+	// maps to.
 	Runes []rune
 
 	// PostScriptName is the name of the font: its PostScript name, or its
@@ -226,6 +254,9 @@ func (f *Face) program() (*sfnt.SFNT, error) {
 			f.parseErr = errors.New("CFF2 outlines cannot be embedded")
 		default:
 			f.parsed, f.parseErr = sfnt.ParseSFNT(f.data, f.index)
+			if f.parseErr == nil {
+				f.parseErr = f.parsed.CanSubset()
+			}
 		}
 	})
 	return f.parsed, f.parseErr
@@ -280,6 +311,22 @@ func (f *Face) Embed(glyphs []uint16, opts EmbedOptions) (Embedded, error) {
 			list = append(list, g)
 		}
 	}
+	// A composite glyph is drawn from other glyphs, which the program must
+	// hold too: they come after the glyphs asked for, as Subset puts them.
+	if parsed.IsTrueType && parsed.Glyf != nil && !opts.KeepAllGlyphs {
+		for _, g := range list[1:] {
+			components, err := parsed.Glyf.Dependencies(g)
+			if err != nil {
+				return Embedded{}, fmt.Errorf("subsetting the font: %w", err)
+			}
+			for _, c := range components {
+				if !seen[c] {
+					seen[c] = true
+					list = append(list, c)
+				}
+			}
+		}
+	}
 	out := Embedded{
 		Glyphs:     list,
 		Advances:   make([]uint16, len(list)),
@@ -298,8 +345,8 @@ func (f *Face) Embed(glyphs []uint16, opts EmbedOptions) (Embedded, error) {
 	}
 	for i, g := range list {
 		out.Advances[i] = parsed.GlyphAdvance(g)
-		if rs := parsed.GlyphToUnicode(g); len(rs) != 0 {
-			out.Runes[i] = rs[0]
+		if i != 0 {
+			out.Runes[i] = characterOf(parsed.GlyphToUnicode(g))
 		}
 	}
 names:
@@ -314,7 +361,9 @@ names:
 	}
 
 	program := parsed
-	if !opts.KeepAllGlyphs {
+	if opts.KeepAllGlyphs {
+		program = withoutVariations(parsed)
+	} else {
 		if parsed.IsCFF && parsed.CFF != nil {
 			parsed.CFF.SetGlyphNames(nil)
 		}
@@ -334,4 +383,52 @@ names:
 	}
 	out.Program, out.TrueType = program.Write(), program.IsTrueType
 	return out, nil
+}
+
+// characterOf returns the character a glyph stands for, among those the
+// font maps to it: the first that is one. A font may map a control code or
+// a private-use code to the glyph of a character as well (U+0080 to the euro
+// sign, for a Windows code page), and those say nothing to who copies or
+// searches the text. It returns 0 for a glyph no character maps to.
+func characterOf(runes []rune) rune {
+	var fallback rune
+	for _, r := range runes {
+		switch {
+		case r <= 0 || r == 0xFFFF:
+		case r < 0x20 || 0x7F <= r && r < 0xA0, // C0 and C1 controls
+			0xE000 <= r && r <= 0xF8FF, 0xF0000 <= r: // private use
+			if fallback == 0 {
+				fallback = r
+			}
+		default:
+			return r
+		}
+	}
+	return fallback
+}
+
+// variationTables are the tables that make a font variable.
+var variationTables = []string{"fvar", "gvar", "avar", "cvar", "HVAR", "VVAR", "MVAR", "STAT"}
+
+// withoutVariations returns the font without its variation tables: its
+// default instance. The font itself is left as it is.
+func withoutVariations(font *sfnt.SFNT) *sfnt.SFNT {
+	variable := false
+	for _, tag := range variationTables {
+		if _, ok := font.Tables[tag]; ok {
+			variable = true
+		}
+	}
+	if !variable {
+		return font
+	}
+	static := *font
+	static.Tables = make(map[string][]byte, len(font.Tables))
+	for tag, table := range font.Tables {
+		static.Tables[tag] = table
+	}
+	for _, tag := range variationTables {
+		delete(static.Tables, tag)
+	}
+	return &static
 }

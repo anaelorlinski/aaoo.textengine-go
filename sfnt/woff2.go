@@ -172,7 +172,9 @@ func ParseWOFF2(b []byte) ([]byte, error) {
 	}
 	rBrotli := brotli.NewReader(bytes.NewReader(compData)) // err is always nil
 	dataBuf := bytes.NewBuffer(make([]byte, 0, uncompressedSize))
-	if _, err := io.Copy(dataBuf, rBrotli); err != nil {
+	// read no more than the tables say they hold, and one byte to tell a
+	// stream that holds more
+	if _, err := io.Copy(dataBuf, io.LimitReader(rBrotli, int64(uncompressedSize)+1)); err != nil {
 		return nil, err
 	}
 	data := dataBuf.Bytes()

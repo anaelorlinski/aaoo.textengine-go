@@ -72,4 +72,10 @@ func TestVerticalResolve(t *testing.T) {
 	noWin := v
 	noWin.WinAscent, noWin.WinDescent = 0, 0
 	check("no Windows values", noWin, MicrosoftRule, 700, 300, 200)
+
+	// A font that stores a negative descent in the unsigned Windows field:
+	// the box is then larger than the hhea line, and no gap is left. The sum
+	// of the two Windows values passes 65535.
+	wrapped := Vertical{HheaAscender: 2294, HheaDescender: -901, HheaLineGap: 0, WinAscent: 2294, WinDescent: 64143}
+	check("Windows descent stored negative", wrapped, MicrosoftRule, 2294, 64143, 0)
 }

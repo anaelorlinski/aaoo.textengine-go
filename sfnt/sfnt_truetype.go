@@ -72,7 +72,9 @@ type glyfTable struct {
 func (glyf *glyfTable) Get(glyphID uint16) []byte {
 	start, ok1 := glyf.loca.Get(glyphID)
 	end, ok2 := glyf.loca.Get(glyphID + 1)
-	if !ok1 || !ok2 {
+	if !ok1 || !ok2 || end < start || uint32(len(glyf.data)) < end {
+		// loca is not validated when it is read: offsets that decrease or
+		// point past the table are those of a glyph that does not exist
 		return nil
 	}
 	return glyf.data[start:end]
@@ -87,47 +89,59 @@ func (glyf *glyfTable) IsComposite(glyphID uint16) bool {
 	return b[0]&0x80 != 0 // sign bit is set on numberOfContours
 }
 
-// Dependencies returns all the glyph IDs that a composite glyph uses.
+// Dependencies returns all the glyph IDs that a composite glyph uses: the
+// glyph itself first, then its components and theirs, each once.
 func (glyf *glyfTable) Dependencies(glyphID uint16) ([]uint16, error) {
-	return glyf.dependencies(glyphID, 0)
+	deps := []uint16{}
+	seen := map[uint16]bool{}
+	if err := glyf.dependencies(glyphID, 0, seen, &deps); err != nil {
+		return nil, err
+	}
+	return deps, nil
 }
 
-func (glyf *glyfTable) dependencies(glyphID uint16, level int) ([]uint16, error) {
-	deps := []uint16{glyphID}
+// dependencies visits a glyph once: a font whose components fan out, each
+// composite made of many copies of the next, would otherwise be walked a
+// number of times that grows with the power of the nesting.
+func (glyf *glyfTable) dependencies(glyphID uint16, level int, seen map[uint16]bool, deps *[]uint16) error {
+	if seen[glyphID] {
+		return nil
+	}
+	seen[glyphID] = true
+	*deps = append(*deps, glyphID)
+
 	b := glyf.Get(glyphID)
 	if b == nil {
-		return nil, fmt.Errorf("glyf: bad glyphID %v", glyphID)
+		return fmt.Errorf("glyf: bad glyphID %v", glyphID)
 	} else if len(b) == 0 {
-		return deps, nil
+		return nil
 	}
 	r := bin.NewBinaryReaderBytes(b)
 	if r.Len() < 10 {
-		return nil, fmt.Errorf("glyf: bad table for glyphID %v", glyphID)
+		return fmt.Errorf("glyf: bad table for glyphID %v", glyphID)
 	}
 	numberOfContours := r.ReadInt16()
 	_ = r.ReadBytes(8)
 	if numberOfContours < 0 {
 		if 7 < level {
-			return nil, fmt.Errorf("glyf: compound glyphs too deeply nested")
+			return fmt.Errorf("glyf: compound glyphs too deeply nested")
 		}
 
 		// composite glyph
 		for {
 			if r.Len() < 4 {
-				return nil, fmt.Errorf("glyf: bad table for glyphID %v", glyphID)
+				return fmt.Errorf("glyf: bad table for glyphID %v", glyphID)
 			}
 
 			flags := r.ReadUint16()
 			subGlyphID := r.ReadUint16()
-			subDeps, err := glyf.dependencies(subGlyphID, level+1)
-			if err != nil {
-				return nil, err
+			if err := glyf.dependencies(subGlyphID, level+1, seen, deps); err != nil {
+				return err
 			}
-			deps = append(deps, subDeps...)
 
 			length, more := glyfCompositeLength(flags)
 			if r.Len() < int64(length)-4 {
-				return nil, fmt.Errorf("glyf: bad table for glyphID %v", glyphID)
+				return fmt.Errorf("glyf: bad table for glyphID %v", glyphID)
 			}
 			_ = r.ReadBytes(int64(length) - 4)
 			if !more {
@@ -135,7 +149,7 @@ func (glyf *glyfTable) dependencies(glyphID uint16, level int) ([]uint16, error)
 			}
 		}
 	}
-	return deps, nil
+	return nil
 }
 
 func glyfCompositeLength(flags uint16) (length uint32, more bool) {
@@ -157,10 +171,19 @@ func glyfCompositeLength(flags uint16) (length uint32, more bool) {
 // Contour returns the contours of a glyph. It unpacks composite glyphs into their final shape.
 func (glyf *glyfTable) Contour(glyphID uint16) (*glyfContour, error) {
 	// TODO: cache output
-	return glyf.contour(glyphID, 0)
+	budget := maxGlyfComponents
+	return glyf.contour(glyphID, 0, &budget)
 }
 
-func (glyf *glyfTable) contour(glyphID uint16, level int) (*glyfContour, error) {
+// maxGlyfComponents is the number of components a glyph may be made of, all
+// levels together. A glyph of a real font has a handful; the limit stops a
+// font whose components fan out at every level.
+const maxGlyfComponents = 4096
+
+func (glyf *glyfTable) contour(glyphID uint16, level int, budget *int) (*glyfContour, error) {
+	if *budget--; *budget < 0 {
+		return nil, fmt.Errorf("glyf: glyph made of too many components")
+	}
 	b := glyf.Get(glyphID)
 	if b == nil {
 		return nil, fmt.Errorf("glyf: bad glyphID %v", glyphID)
@@ -195,7 +218,10 @@ func (glyf *glyfTable) contour(glyphID uint16, level int) (*glyfContour, error) 
 		}
 		contour.Instructions = r.ReadBytes(int64(instructionLength))
 
-		numPoints := int(contour.EndPoints[numberOfContours-1]) + 1
+		numPoints := 0
+		if 0 < numberOfContours {
+			numPoints = int(contour.EndPoints[numberOfContours-1]) + 1
+		}
 		flags := make([]byte, numPoints)
 		contour.OnCurve = make([]bool, numPoints)
 		contour.OverlapSimple = make([]bool, numPoints)
@@ -209,6 +235,9 @@ func (glyf *glyfTable) contour(glyphID uint16, level int) (*glyfContour, error) 
 			contour.OverlapSimple[i] = flags[i]&0x40 != 0
 			if flags[i]&0x08 != 0 { // REPEAT_FLAG
 				repeats := r.ReadUint8()
+				if numPoints <= i+int(repeats) {
+					return nil, fmt.Errorf("glyf: bad flags for glyphID %v", glyphID)
+				}
 				for j := 1; j <= int(repeats); j++ {
 					flags[i+j] = flags[i]
 					contour.OnCurve[i+j] = contour.OnCurve[i]
@@ -320,7 +349,7 @@ func (glyf *glyfTable) contour(glyphID uint16, level int) (*glyfContour, error) 
 				hasInstructions = true
 			}
 
-			subContour, err := glyf.contour(subGlyphID, level+1)
+			subContour, err := glyf.contour(subGlyphID, level+1, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -455,9 +484,9 @@ type locaTable struct {
 }
 
 func (loca *locaTable) Get(glyphID uint16) (uint32, bool) {
-	if loca.Format == 0 && int(glyphID)*2 < len(loca.data) {
+	if loca.Format == 0 && int(glyphID)*2+2 <= len(loca.data) {
 		return 2 * uint32(binary.BigEndian.Uint16(loca.data[int(glyphID)*2:])), true
-	} else if loca.Format == 1 && int(glyphID)*4 < len(loca.data) {
+	} else if loca.Format == 1 && int(glyphID)*4+4 <= len(loca.data) {
 		return binary.BigEndian.Uint32(loca.data[int(glyphID)*4:]), true
 	}
 	return 0, false

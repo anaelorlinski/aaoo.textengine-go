@@ -1,6 +1,7 @@
 package face
 
 import (
+	"crypto/sha256"
 	"errors"
 	"os"
 
@@ -22,6 +23,8 @@ type Collection struct {
 	faces      map[*font.Face]*Face // the face of each font resolved
 	registered map[*font.Font]Style // the style a font was last added with
 	files      map[string][]byte    // the font files read from disk, by path
+
+	contents map[[sha256.Size]byte][]byte // the bytes of the fonts added, by their hash
 }
 
 // NewCollection returns a collection over a font map of go-text, which
@@ -34,6 +37,7 @@ func NewCollection(fm *fontscan.FontMap) *Collection {
 		faces:      map[*font.Face]*Face{},
 		registered: map[*font.Font]Style{},
 		files:      map[string][]byte{},
+		contents:   map[[sha256.Size]byte][]byte{},
 	}
 }
 
@@ -44,9 +48,16 @@ func (c *Collection) FontMap() *fontscan.FontMap { return c.fm }
 // one font) available under the family and the style of d, whatever the font
 // says of itself.
 //
-// key identifies the content: it is what fontscan.Location.File holds for
-// the font. The same key may be added under several families and styles: the
-// font is then parsed once, and data is not read again.
+// key identifies the font: it is what fontscan.Location.File holds for it.
+// The same key may be added under several families and styles: the font is
+// then parsed once, and data is not read again.
+//
+// Two keys may hold the same bytes, as when a file is declared twice with
+// different styles. They are two fonts for layout, each with the style it
+// was added with, and one file for an output: see Face.File.
+//
+// The collection keeps data, or what it decodes to, without copying it: it
+// must not be modified afterwards.
 func (c *Collection) Add(key string, data []byte, d Description) (*Face, error) {
 	f, known := c.added[key]
 	if !known {
@@ -56,6 +67,13 @@ func (c *Collection) Add(key string, data []byte, d Description) (*Face, error) 
 		plain, err := sfnt.ToSFNT(data)
 		if err != nil {
 			return nil, err
+		}
+		// the same bytes are kept once, whatever the keys they come under
+		hash := sha256.Sum256(plain)
+		if same, ok := c.contents[hash]; ok {
+			plain = same
+		} else {
+			c.contents[hash] = plain
 		}
 		lds, err := loaders(plain)
 		if err != nil {

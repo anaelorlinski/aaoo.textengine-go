@@ -26,6 +26,10 @@ type cffTable struct {
 	charset     []string
 	charStrings *cffINDEX
 	fonts       *cffFontINDEX
+
+	// lastNumLen is the number of bytes of the last operand parseCharString
+	// read, for the callbacks that rewrite an operand in place.
+	lastNumLen int
 }
 
 func (sfnt *SFNT) parseCFF() error {
@@ -167,7 +171,7 @@ func (sfnt *SFNT) parseCFF() error {
 	}
 
 	if !topDICT.IsCID {
-		if len(b) < topDICT.PrivateOffset || len(b)-topDICT.PrivateOffset < topDICT.PrivateLength {
+		if topDICT.PrivateOffset < 0 || topDICT.PrivateLength < 0 || len(b) < topDICT.PrivateOffset || len(b)-topDICT.PrivateOffset < topDICT.PrivateLength {
 			return fmt.Errorf("CFF: bad Private DICT offset")
 		}
 		privateDICT, err := parsePrivateDICT(b[topDICT.PrivateOffset:topDICT.PrivateOffset+topDICT.PrivateLength], false)
@@ -177,7 +181,7 @@ func (sfnt *SFNT) parseCFF() error {
 
 		localSubrsINDEX := &cffINDEX{}
 		if privateDICT.Subrs != 0 {
-			if len(b)-topDICT.PrivateOffset < privateDICT.Subrs {
+			if privateDICT.Subrs < 0 || len(b)-topDICT.PrivateOffset < privateDICT.Subrs {
 				return fmt.Errorf("CFF: bad Local Subrs INDEX offset")
 			}
 			r.Seek(int64(topDICT.PrivateOffset+privateDICT.Subrs), 0)
@@ -396,6 +400,11 @@ func (cff *cffTable) getSubroutine(glyphID uint16, b0 int32, stack int32) (int32
 	return index, subr, nil
 }
 
+// maxCharStringSteps is the number of operands and operators a charstring
+// may run through, its subroutines included. The glyphs of real fonts stay
+// under a few tens of thousands.
+const maxCharStringSteps = 1 << 20
+
 func (cff *cffTable) parseCharString(glyphID uint16, cb func(*bin.BinaryReader, int32, []int32) error) error {
 	table := "CFF"
 	if cff.version == 2 {
@@ -415,7 +424,13 @@ func (cff *cffTable) parseCharString(glyphID uint16, cb func(*bin.BinaryReader, 
 	hints := 0
 	stack := []int32{}
 	beforeMoveto := true
+	steps := 0
 	for {
+		// Subroutines nest ten deep and nothing else bounds how many times
+		// each is called: a font can make one glyph run for hours.
+		if steps++; maxCharStringSteps < steps {
+			return fmt.Errorf("%v: charstring of glyph %v runs for too long", table, glyphID)
+		}
 		if cff.version == 2 && r.Len() == 0 && 0 < len(callStack) {
 			// end of subroutine
 			r = callStack[len(callStack)-1]
@@ -425,9 +440,11 @@ func (cff *cffTable) parseCharString(glyphID uint16, cb func(*bin.BinaryReader, 
 			break
 		}
 
+		numStart := r.Pos()
 		b0 := int32(r.ReadUint8())
 		if 32 <= b0 || b0 == cffShortint {
 			v := cffReadCharStringNumber(r, b0)
+			cff.lastNumLen = int(r.Pos() - numStart)
 			if cff.version == 1 && 48 <= len(stack) || cff.version == 2 && 513 <= len(stack) {
 				return fmt.Errorf("%v: too many operands for operator", table)
 			}
@@ -445,6 +462,9 @@ func (cff *cffTable) parseCharString(glyphID uint16, cb func(*bin.BinaryReader, 
 						hasWidth = !hasWidth
 					}
 					if hasWidth {
+						if len(stack) == 0 {
+							return fmt.Errorf("%v: %v", table, ErrBadNumOperands)
+						}
 						stack = stack[1:]
 					}
 					if b0 == cffRmoveto || b0 == cffHmoveto || b0 == cffVmoveto {
@@ -863,14 +883,6 @@ func (cff *cffTable) updateSubrs(localSubrsMap, globalSubrsMap map[int32]int32, 
 		return nil
 	}
 
-	oldLocalSubrsLen := 0
-	if 0 < len(cff.fonts.localSubrs) {
-		oldLocalSubrsLen = cff.fonts.localSubrs[0].Len()
-	}
-	oldGlobalSubrsLen := cff.globalSubrs.Len()
-	oldLocalSubrsBias := int32(cffCharStringSubrsBias(oldLocalSubrsLen))
-	oldGlobalSubrsBias := int32(cffCharStringSubrsBias(oldGlobalSubrsLen))
-
 	localSubrsHandled := map[int32]bool{}  // old indices
 	globalSubrsHandled := map[int32]bool{} // old indices
 	localSubrsBias := int32(cffCharStringSubrsBias(localSubrsLen))
@@ -901,18 +913,15 @@ func (cff *cffTable) updateSubrs(localSubrsMap, globalSubrsMap map[int32]int32, 
 				}
 
 				mapped := false
-				var oldBias int32
 				var newIndex, newBias int32
 				if b0 == cffCallsubr {
 					if v, ok := localSubrsMap[oldIndex]; ok {
-						oldBias = oldLocalSubrsBias
 						newIndex = v
 						newBias = localSubrsBias
 						mapped = true
 					}
 				} else {
 					if v, ok := globalSubrsMap[oldIndex]; ok {
-						oldBias = oldGlobalSubrsBias
 						newIndex = v
 						newBias = globalSubrsBias
 						mapped = true
@@ -920,7 +929,9 @@ func (cff *cffTable) updateSubrs(localSubrsMap, globalSubrsMap map[int32]int32, 
 				}
 
 				if skipDepth == 0 && mapped && oldIndex != newIndex {
-					lenNumber := uint32(cffNumberSize(int(oldIndex - oldBias)))
+					// the bytes the number takes in the charstring, which
+					// need not be the shortest encoding of its value
+					lenNumber := uint32(cff.lastNumLen)
 					posNumber := uint32(r.Pos()) - 1 - lenNumber // -1 as we're past the operator
 
 					index := indexStack[len(indexStack)-1]
@@ -1158,7 +1169,9 @@ func (t *cffINDEX) Get(i uint16) []byte {
 
 func (t *cffINDEX) GetSID(sid int) string {
 	// only for String INDEX
-	if sid < len(cffStandardStrings) {
+	if sid < 0 {
+		return ""
+	} else if sid < len(cffStandardStrings) {
 		return cffStandardStrings[sid]
 	}
 	sid -= len(cffStandardStrings)
@@ -1266,6 +1279,15 @@ func parseINDEX(r *bin.BinaryReader, isCFF2 bool) (*cffINDEX, error) {
 	if r.Len() < int64(t.offset[count]) {
 		return nil, fmt.Errorf("bad data")
 	}
+	// the offsets start at the beginning of the data and never go back
+	if t.offset[0] != 0 {
+		return nil, fmt.Errorf("bad offsets")
+	}
+	for i := uint32(0); i < count; i++ {
+		if t.offset[i+1] < t.offset[i] {
+			return nil, fmt.Errorf("bad offsets")
+		}
+	}
 	t.data = r.ReadBytes(int64(t.offset[count]))
 	return t, nil
 }
@@ -1275,7 +1297,7 @@ func cffINDEXOffSize(n int) int {
 		return 1
 	} else if n <= math.MaxUint16 {
 		return 2
-	} else if n <= (2<<24 - 1) {
+	} else if n <= (1<<24 - 1) {
 		return 3
 	}
 	return 4
@@ -1306,7 +1328,7 @@ func (t *cffINDEX) Write() ([]byte, error) {
 	} else if offSize == 3 {
 		for _, offset := range t.offset {
 			w.WriteUint8(uint8((offset + 1) >> 16))
-			w.WriteUint16(uint16((offset + 1) & 0x00FF))
+			w.WriteUint16(uint16((offset + 1) & 0xFFFF))
 		}
 	} else if offSize == 4 {
 		for _, offset := range t.offset {
@@ -1803,8 +1825,14 @@ func parseDICTNumber(b0 int, r *bin.BinaryReader) (int, float64) {
 	} else if b0 == 29 {
 		return int(r.ReadInt32()), math.NaN()
 	} else if b0 == 30 {
+		// A real number is a few dozen nibbles at most and ends with 0xF.
+		// Data that ends before that is malformed: reading past the end
+		// gives zeros forever.
 		num := []byte{}
 		for {
+			if r.Len() <= 0 || 64 < len(num) {
+				return 0, math.NaN()
+			}
 			b := r.ReadUint8()
 			for i := 0; i < 2; i++ {
 				switch b >> 4 {
@@ -1878,6 +1906,24 @@ func cffDICTIntegerSize(i int) int {
 	return cffNumberSize(i)
 }
 
+// cffDICTOffsetSize is the size of an offset written by writeDICTOffsets.
+const cffDICTOffsetSize = 5
+
+// writeDICTOffsets writes an entry whose operands are offsets or lengths
+// into the table, each as a 32-bit integer whatever its value.
+//
+// The size of a number in a DICT depends on its value, and an offset depends
+// on the size of the DICT that holds it: with the shortest encoding the two
+// have to be solved together, and get it wrong when an offset crosses a size
+// boundary (108, 1132, 32768). A fixed size costs a few bytes and cannot.
+func writeDICTOffsets(w *bin.BinaryWriter, op uint8, vals ...int) {
+	for _, v := range vals {
+		w.WriteUint8(29)
+		w.WriteUint32(uint32(int32(v)))
+	}
+	w.WriteUint8(op)
+}
+
 func writeDICTEntry(w *bin.BinaryWriter, op int, vals ...any) error {
 	if len(vals) == 1 {
 		switch vs := vals[0].(type) {
@@ -1898,7 +1944,7 @@ func writeDICTEntry(w *bin.BinaryWriter, op int, vals ...any) error {
 	}
 
 	allowFloat := false
-	if 5 <= op && op <= 11 || op == 20 || op == 21 || 255+2 <= op && op <= 255+4 || 255+7 <= op && op <= 255+13 || op == 255+18 || op == 255+23 {
+	if 5 <= op && op <= 11 || op == 20 || op == 21 || 256+2 <= op && op <= 256+4 || 256+7 <= op && op <= 256+13 || op == 256+18 || op == 256+23 {
 		// strictly most operators allow a number and thus an integer or real operand but in
 		// practice these are offsets (and thus integers) and some parsers expect them to be
 		// integers (even though a float may be shorter for e.g. 32790 (3 bytes) instead of
@@ -1988,6 +2034,10 @@ type cffFontINDEX struct {
 }
 
 func (t *cffFontINDEX) Index(glyphID uint32) (uint16, bool) {
+	return t.index(glyphID)
+}
+
+func (t *cffFontINDEX) index(glyphID uint32) (uint16, bool) {
 	if t.fds != nil {
 		if len(t.fds) <= int(glyphID) {
 			return 0, false
@@ -1998,10 +2048,10 @@ func (t *cffFontINDEX) Index(glyphID uint32) (uint16, bool) {
 	}
 
 	i := 0
-	for t.first[i+1] <= glyphID {
+	for i+1 < len(t.first) && t.first[i+1] <= glyphID {
 		i++
 	}
-	if len(t.fd) < i {
+	if len(t.fd) <= i {
 		return 0, false
 	}
 	return t.fd[i], true
@@ -2010,7 +2060,8 @@ func (t *cffFontINDEX) Index(glyphID uint32) (uint16, bool) {
 // GetPrivate returns the Private DICT for the glyph's font, or nil if the font has none.
 func (t *cffFontINDEX) GetPrivate(glyphID uint16) *cffPrivateDICT {
 	i, ok := t.Index(uint32(glyphID))
-	if !ok {
+	if !ok || len(t.private) <= int(i) {
+		// FDSelect is read as it is: a font number it gives may not exist
 		return nil
 	}
 	return t.private[i]
@@ -2019,14 +2070,14 @@ func (t *cffFontINDEX) GetPrivate(glyphID uint16) *cffPrivateDICT {
 // GetLocalSubrs returns the LocalSubrs INDEX for the glyph's font, or nil if the font has none.
 func (t *cffFontINDEX) GetLocalSubrs(glyphID uint16) *cffINDEX {
 	i, ok := t.Index(uint32(glyphID))
-	if !ok {
+	if !ok || len(t.localSubrs) <= int(i) {
 		return nil
 	}
 	return t.localSubrs[i]
 }
 
 func parseFontINDEX(b []byte, fdArray, fdSelect, nGlyphs int, isCFF2 bool) (*cffFontINDEX, error) {
-	if len(b) < fdArray {
+	if fdArray < 0 || fdSelect < 0 || len(b) < fdArray || len(b) < fdSelect {
 		return nil, fmt.Errorf("bad Font INDEX offset")
 	}
 
@@ -2045,7 +2096,7 @@ func parseFontINDEX(b []byte, fdArray, fdSelect, nGlyphs int, isCFF2 bool) (*cff
 		if err != nil {
 			return nil, fmt.Errorf("Font DICT: %w", err)
 		}
-		if len(b) < fontDICT.PrivateOffset || len(b)-fontDICT.PrivateOffset < fontDICT.PrivateLength {
+		if fontDICT.PrivateOffset < 0 || fontDICT.PrivateLength < 0 || len(b) < fontDICT.PrivateOffset || len(b)-fontDICT.PrivateOffset < fontDICT.PrivateLength {
 			return nil, fmt.Errorf("Font DICT: bad Private DICT offset")
 		}
 		privateDICT, err := parsePrivateDICT(b[fontDICT.PrivateOffset:fontDICT.PrivateOffset+fontDICT.PrivateLength], isCFF2)
@@ -2055,7 +2106,7 @@ func parseFontINDEX(b []byte, fdArray, fdSelect, nGlyphs int, isCFF2 bool) (*cff
 		fonts.private[i] = privateDICT
 
 		if privateDICT.Subrs != 0 {
-			if len(b)-fontDICT.PrivateOffset < privateDICT.Subrs {
+			if privateDICT.Subrs < 0 || len(b)-fontDICT.PrivateOffset < privateDICT.Subrs {
 				return nil, fmt.Errorf("bad Local Subrs INDEX offset")
 			}
 			r.Seek(int64(fontDICT.PrivateOffset+privateDICT.Subrs), 0)
@@ -2071,12 +2122,18 @@ func parseFontINDEX(b []byte, fdArray, fdSelect, nGlyphs int, isCFF2 bool) (*cff
 	r.Seek(int64(fdSelect), 0)
 	format := r.ReadUint8()
 	if format == 0 {
+		if nGlyphs < 0 || r.Len() < int64(nGlyphs) {
+			return nil, fmt.Errorf("FDSelect: bad data")
+		}
 		fonts.fds = make([]uint8, nGlyphs)
 		for i := 0; i < nGlyphs; i++ {
 			fonts.fds[i] = r.ReadUint8()
 		}
 	} else if format == 3 {
 		nRanges := r.ReadUint16()
+		if r.Len() < 3*int64(nRanges)+2 {
+			return nil, fmt.Errorf("FDSelect: bad data")
+		}
 		fonts.first = make([]uint32, nRanges+1)
 		fonts.fd = make([]uint16, nRanges)
 		for i := 0; i < int(nRanges); i++ {
@@ -2086,6 +2143,9 @@ func parseFontINDEX(b []byte, fdArray, fdSelect, nGlyphs int, isCFF2 bool) (*cff
 		fonts.first[nRanges] = uint32(r.ReadUint16())
 	} else if isCFF2 && format == 4 {
 		nRanges := r.ReadUint32()
+		if r.Len() < 6*int64(nRanges)+4 {
+			return nil, fmt.Errorf("FDSelect: bad data")
+		}
 		fonts.first = make([]uint32, nRanges+1)
 		fonts.fd = make([]uint16, nRanges)
 		for i := 0; i < int(nRanges); i++ {
@@ -2195,7 +2255,17 @@ func (cff *cffTable) Write() ([]byte, error) {
 			}
 		}
 	} else if 229 < numGlyphs {
-		return nil, fmt.Errorf("charset must be set explicitly for more than 229 glyphs")
+		// Without a charset a font has the 229 glyphs of the ISOAdobe one.
+		// A larger font without glyph names, as a subset for a PDF is, gets
+		// the identity: glyph i has string i. The strings past the standard
+		// ones must exist, whatever they say.
+		for i := strings.Len(); i < numGlyphs-len(cffStandardStrings); i++ {
+			strings.Add([]byte(fmt.Sprintf("g%d", i+len(cffStandardStrings))))
+		}
+		charset = bin.NewBinaryWriter([]byte{})
+		charset.WriteUint8(2)                      // format 2: ranges with a 16-bit count
+		charset.WriteUint16(1)                     // first SID; glyph 0 is .notdef
+		charset.WriteUint16(uint16(numGlyphs - 2)) // glyphs left in the range
 	}
 
 	stringINDEX, err := strings.Write()
@@ -2231,33 +2301,32 @@ func (cff *cffTable) Write() ([]byte, error) {
 			return nil, fmt.Errorf("Private DICT: %v", err)
 		}
 
-		if len(cff.fonts.localSubrs) != 0 {
+		if len(cff.fonts.localSubrs) != 0 && cff.fonts.localSubrs[0] != nil && 0 < cff.fonts.localSubrs[0].Len() {
 			localSubrsINDEX, err = cff.fonts.localSubrs[0].Write()
 			if err != nil {
 				return nil, fmt.Errorf("Local Subrs INDEX: %v", err)
 			}
 
-			// write offset to Private DICT
-			localSubrsOffset = len(privateDICT) + 1                  // key
-			localSubrsOffset += cffDICTIntegerSize(localSubrsOffset) // val
+			// write offset to Private DICT: the subroutines follow it
+			localSubrsOffset = len(privateDICT) + 1 + cffDICTOffsetSize // key and value
 			wPrivate := bin.NewBinaryWriter(privateDICT)
-			writeDICTEntry(wPrivate, 19, localSubrsOffset)
+			writeDICTOffsets(wPrivate, 19, localSubrsOffset)
 			privateDICT = wPrivate.Bytes()
 		}
 	}
 
-	// The offset values in Top DICT may push down the offsets themselves. Calculate the size
-	// of Top DICT and thus the positions of each offset without the offset values in Top DICT
-	// and then iteratively recalculate the offsets when added to Top DICT
+	// The offsets in Top DICT are written with a fixed size, see
+	// writeDICTOffsets, so that the size of Top DICT and with it the
+	// position of everything after it are known before they are.
 	lenTopDICT := len(topDICT)
 	if charset != nil {
-		lenTopDICT += 1 // key
+		lenTopDICT += cffDICTOffsetSize + 1 // offset and key
 	}
-	lenTopDICT += 1 // charStrings key
+	lenTopDICT += cffDICTOffsetSize + 1 // charStrings offset and key
 	if privateDICT != nil {
-		lenTopDICT += 1 + cffDICTIntegerSize(len(privateDICT)) // key and size
+		lenTopDICT += 2*cffDICTOffsetSize + 1 // size, offset and key
 	}
-	lenTopDICTINDEXOffSize := cffINDEXOffSize(lenTopDICT)
+	lenTopDICTINDEXOffSize := cffINDEXOffSize(lenTopDICT + 1)
 	lenTopDICTINDEX := 3 + 2*lenTopDICTINDEXOffSize + lenTopDICT
 
 	offset := int(w.Len()) + lenTopDICTINDEX + len(stringINDEX) // no overflow
@@ -2280,34 +2349,19 @@ func (cff *cffTable) Write() ([]byte, error) {
 	}
 	privateOffset := charStringsOffset + len(charStringsINDEX)
 
-	// correct for offset calculated above (grow Top DICT)
-	correct, prevCorrect := 0, -1
-	for correct != prevCorrect {
-		prevCorrect = correct
-		correct = 0
-		if charset != nil {
-			correct += cffDICTIntegerSize(charsetOffset + correct) // integer length in DICT
-		}
-		correct += cffDICTIntegerSize(charStringsOffset + correct) // integer length in DICT
-		if privateDICT != nil {
-			correct += cffDICTIntegerSize(privateOffset + correct) // integer length in DICT
-		}
-		correct += cffINDEXOffSize(lenTopDICT+correct) - lenTopDICTINDEXOffSize // offSize in INDEX
-	}
-	charsetOffset += correct
-	charStringsOffset += correct
-	privateOffset += correct
-
 	// write offsets to Top DICT
 	wTop := bin.NewBinaryWriter(topDICT)
 	if charset != nil {
-		writeDICTEntry(wTop, 15, charsetOffset)
+		writeDICTOffsets(wTop, 15, charsetOffset)
 	}
-	writeDICTEntry(wTop, 17, charStringsOffset)
+	writeDICTOffsets(wTop, 17, charStringsOffset)
 	if privateDICT != nil {
-		writeDICTEntry(wTop, 18, len(privateDICT), privateOffset)
+		writeDICTOffsets(wTop, 18, len(privateDICT), privateOffset)
 	}
 	topDICT = wTop.Bytes()
+	if len(topDICT) != lenTopDICT {
+		return nil, fmt.Errorf("Top DICT: unexpected size")
+	}
 
 	// create Top DICT INDEX
 	top := &cffINDEX{}

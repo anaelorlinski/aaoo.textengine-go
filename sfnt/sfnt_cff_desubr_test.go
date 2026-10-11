@@ -182,3 +182,58 @@ func TestSubsetDesubroutinize(t *testing.T) {
 		}
 	}
 }
+
+// Operators the inliner does not follow are refused, not copied: a stem
+// operand computed with an arithmetic operator would be miscounted, the hint
+// mask read with the wrong length and its bytes taken for operators (0x0e,
+// a usual mask, is endchar: the glyph would end there, without its outline).
+func TestDesubroutinizeRefusesWhatItDoesNotFollow(t *testing.T) {
+	num := func(v int) byte { return byte(v + 139) } // one-byte operand
+	square := []byte{num(100), num(100), byte(cffRmoveto), num(100), byte(cffHlineto), num(100), byte(cffVlineto), byte(cffReturn)}
+
+	// 13 stem operands, a 14th computed as 60 + 10, then the hints, a mask
+	// and the outline, in a subroutine
+	var arithmetic []byte
+	for i := 1; i <= 13; i++ {
+		arithmetic = append(arithmetic, num(5*i))
+	}
+	arithmetic = append(arithmetic, num(60), num(10), 12, 10 /* add */, byte(cffHstemhm), byte(cffHintmask), 0x0e)
+	arithmetic = append(arithmetic, num(-107), byte(cffCallsubr), byte(cffEndchar))
+
+	// the same with the 14th operand written out: this one is inlined
+	var plain []byte
+	for i := 1; i <= 14; i++ {
+		plain = append(plain, num(5*i))
+	}
+	plain = append(plain, byte(cffHstemhm), byte(cffHintmask), 0x0e, num(-107), byte(cffCallsubr), byte(cffEndchar))
+
+	// an accented character made of two other glyphs: adx ady bchar achar
+	accented := []byte{num(0), num(0), num(65), num(100), byte(cffEndchar)}
+
+	localSubrs := &cffINDEX{}
+	localSubrs.Add(square)
+	charStrings := &cffINDEX{}
+	for _, cs := range [][]byte{arithmetic, plain, accented} {
+		charStrings.Add(cs)
+	}
+	cff := &cffTable{
+		version:     1,
+		globalSubrs: &cffINDEX{},
+		charStrings: charStrings,
+		fonts: &cffFontINDEX{
+			fds:        []uint8{0, 0, 0},
+			localSubrs: []*cffINDEX{localSubrs},
+		},
+	}
+
+	if got, err := cff.inlineCharString(0); err == nil {
+		t.Errorf("a charstring with an arithmetic operator is inlined as % x", got)
+	}
+	got, err := cff.inlineCharString(1)
+	test.Error(t, err)
+	want := append(append(append([]byte{}, plain[:17]...), square[:len(square)-1]...), byte(cffEndchar))
+	test.T(t, string(got), string(want))
+	if got, err := cff.inlineCharString(2); err == nil {
+		t.Errorf("an accented character made of two glyphs is inlined as % x", got)
+	}
+}

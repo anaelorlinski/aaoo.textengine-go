@@ -74,7 +74,12 @@ func ParseEOT(b []byte) ([]byte, error) {
 	isCompressed := (flags & 0x00000004) != 0
 	isXORed := (flags & 0x10000000) != 0
 
+	if len(fontData) == 0 {
+		return nil, ErrInvalidFontData
+	}
 	if isXORed {
+		// on a copy: the data is the caller's
+		fontData = append([]byte(nil), fontData...)
 		for i := 0; i < len(fontData); i++ {
 			fontData[i] ^= 0x50
 		}

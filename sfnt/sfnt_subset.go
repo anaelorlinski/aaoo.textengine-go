@@ -29,8 +29,24 @@ type SubsetOptions struct {
 	Desubroutinize bool
 }
 
+// CanSubset returns nil when Subset can take the font, and the reason when
+// it cannot: outlines in the CFF2 format, or a CFF font made of several
+// fonts, as the CID-keyed ones of large character sets are.
+func (sfnt *SFNT) CanSubset() error {
+	if _, ok := sfnt.Tables["CFF2"]; ok {
+		return fmt.Errorf("CFF2: not supported")
+	}
+	if sfnt.IsCFF && sfnt.CFF != nil && sfnt.CFF.fonts != nil && (1 < len(sfnt.CFF.fonts.private) || 1 < len(sfnt.CFF.fonts.localSubrs)) {
+		return fmt.Errorf("CFF: only single-font CFFs are supported")
+	}
+	return nil
+}
+
 // Subset trims an SFNT font to contain only the passed glyphIDs, thereby resulting in a significant size reduction. The glyphIDs will apear in the specified order in the file and their dependencies are added to the end.
 func (sfnt *SFNT) Subset(glyphIDs []uint16, options SubsetOptions) (*SFNT, error) {
+	// the glyphs of composite glyphs are added to the list: on a copy, the
+	// slice is the caller's
+	glyphIDs = append([]uint16(nil), glyphIDs...)
 	if sfnt.IsCFF {
 		if _, ok := sfnt.Tables["CFF2"]; ok {
 			// TODO: support subsetting CFF2
@@ -48,9 +64,6 @@ func (sfnt *SFNT) Subset(glyphIDs []uint16, options SubsetOptions) (*SFNT, error
 		// add dependencies for composite glyphs add the end
 		origLen := len(glyphIDs)
 		for i := 0; i < origLen; i++ {
-			if glyphIDs[i] == 0 {
-				continue
-			}
 			deps, err := sfnt.Glyf.Dependencies(glyphIDs[i])
 			if err != nil {
 				return nil, err
@@ -166,7 +179,11 @@ func (sfnt *SFNT) Subset(glyphIDs []uint16, options SubsetOptions) (*SFNT, error
 				rsGlyph := sfntOld.Cmap.ToUnicode(glyphID)
 				rs = append(rs, rsGlyph...)
 				for _, r := range rsGlyph {
-					runeMap[r] = uint16(subsetGlyphID)
+					// Several glyphs may stand for one character: the map
+					// keeps the one the font gives for it.
+					if _, ok := runeMap[r]; !ok || sfntOld.Cmap.Get(r) == glyphID {
+						runeMap[r] = uint16(subsetGlyphID)
+					}
 				}
 			}
 			ulUnicodeRange = os2UlUnicodeRange(rs)
@@ -179,11 +196,9 @@ func (sfnt *SFNT) Subset(glyphIDs []uint16, options SubsetOptions) (*SFNT, error
 			cff := *sfntOld.CFF
 			cff.charStrings = &cffINDEX{}
 			for _, glyphID := range glyphIDs {
-				if glyphID == 0 {
-					// make .notdef empty
-					cff.charStrings.Add([]byte{0x0E}) // endchar
-					continue
-				}
+				// .notdef keeps its outline: it is what a character the
+				// font lacks is drawn with, and a renderer that draws from
+				// the font itself shows it
 
 				charString := sfntOld.CFF.charStrings.Get(glyphID)
 				if charString == nil {
@@ -219,11 +234,7 @@ func (sfnt *SFNT) Subset(glyphIDs []uint16, options SubsetOptions) (*SFNT, error
 		case "glyf":
 			w := bin.NewBinaryWriter([]byte{})
 			for i, glyphID := range glyphIDs {
-				if glyphID == 0 {
-					// empty .notdef
-					glyfOffsets[i+1] = uint32(w.Len())
-					continue
-				} else if sfntOld.Glyf.IsComposite(glyphID) {
+				if sfntOld.Glyf.IsComposite(glyphID) {
 					// composite glyphs, update glyphIDs and make sure not to write to b
 					b := sfntOld.Glyf.Get(glyphID)
 					start := uint32(w.Len())
@@ -393,6 +404,9 @@ func (sfnt *SFNT) Subset(glyphIDs []uint16, options SubsetOptions) (*SFNT, error
 			// handle kern table that could be removed
 			kern := kernTable{
 				Subtables: []kernFormat0{},
+			}
+			if sfntOld.Kern == nil {
+				continue
 			}
 			for _, subtable := range sfntOld.Kern.Subtables {
 				pairs := []kernPair{}

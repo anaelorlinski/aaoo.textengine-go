@@ -76,3 +76,38 @@ func TestCollection(t *testing.T) {
 		t.Errorf("garbage must fail")
 	}
 }
+
+// The same bytes under two keys are two fonts, each with its style, and one
+// file to embed.
+func TestCollectionSharesContent(t *testing.T) {
+	c := NewCollection(fontscan.NewFontMap(quiet{}))
+	data := read(t, "DejaVuSerif.ttf")
+	regular, err := c.Add("rule 1", data, Description{Family: "mine", Style: Style{Weight: WeightRegular}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// another slice holding the same bytes, as another rule naming the file
+	bold, err := c.Add("rule 2", append([]byte(nil), data...), Description{Family: "mine", Style: Style{Weight: WeightBold}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regular == bold {
+		t.Fatalf("two keys gave one face")
+	}
+	if r, _ := c.Registered(regular.GoText().Font); r.Weight != WeightRegular {
+		t.Errorf("the first font is registered with weight %d", r.Weight)
+	}
+	if b, _ := c.Registered(bold.GoText().Font); b.Weight != WeightBold {
+		t.Errorf("the second font is registered with weight %d", b.Weight)
+	}
+	if regular.File() != bold.File() || regular.File() == (File{}) {
+		t.Errorf("the two fonts are not one file")
+	}
+	other, err := c.Add("rule 3", read(t, "EBGaramond12-Regular.otf"), Description{Family: "mine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.File() == regular.File() {
+		t.Errorf("two different fonts are one file")
+	}
+}

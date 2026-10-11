@@ -80,7 +80,15 @@ func (cff *cffTable) inlineCharString(glyphID uint16) ([]byte, error) {
 		numVals = numVals[:0]
 	}
 
+	steps := 0
 	for {
+		// See maxCharStringSteps. The inlined charstring is also held to
+		// the length a charstring may have.
+		if steps++; maxCharStringSteps < steps {
+			return nil, fmt.Errorf("charstring runs for too long")
+		} else if 65535 < len(out) {
+			return nil, fmt.Errorf("charstring too long once its subroutines are inlined")
+		}
 		if cur.r.Len() == 0 {
 			if len(callStack) == 0 {
 				break
@@ -131,6 +139,13 @@ func (cff *cffTable) inlineCharString(glyphID uint16) ([]byte, error) {
 
 		switch op {
 		case cffEndchar:
+			if 4 <= effLen {
+				// The deprecated form that builds an accented character
+				// from two other glyphs, named by their standard codes:
+				// nothing here follows it to those glyphs, and no reader
+				// of this package draws it.
+				return nil, fmt.Errorf("endchar with the operands of an accented character is not supported")
+			}
 			out = append(out, opBytes...)
 			return out, nil
 		case cffCallsubr, cffCallgsubr:
@@ -181,12 +196,14 @@ func (cff *cffTable) inlineCharString(glyphID uint16) ([]byte, error) {
 			out = append(out, opBytes...)
 			clear()
 		default:
-			// Any other operator (including unrecognized/reserved ones) is
-			// copied through verbatim. Only hintmask/cntrmask consume bytes
-			// beyond their opcode, so this stays byte-accurate; clearing the
-			// operand stack matches parseCharString's handling of path ops.
-			out = append(out, opBytes...)
-			clear()
+			// The arithmetic, storage and conditional operators compute
+			// operands, which this function does not: it counts the operands
+			// it copies to know how many stem hints there are, and a count
+			// that is wrong reads a hint mask of the wrong length and takes
+			// its bytes for operators. Refusing them, as parseCharString
+			// does, leaves the charstring to the caller's fallback instead
+			// of writing a glyph that is cut short. No font seen uses them.
+			return nil, fmt.Errorf("unsupported operator %d", op)
 		}
 	}
 

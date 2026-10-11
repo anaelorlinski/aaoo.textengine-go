@@ -21,7 +21,10 @@ type VerticalRule uint8
 const (
 	// ShaperRule takes the typographic values when the font asks for them
 	// (USE_TYPO_METRICS), the hhea ones otherwise: what go-text, HarfBuzz,
-	// FreeType and the browsers of macOS and Linux do.
+	// FreeType and the browsers of macOS and Linux do. Face.Metrics gives
+	// the values of go-text itself; Vertical.Resolve follows the same rule
+	// on the raw tables and may differ from it on unusual fonts, whose line
+	// gap is negative or whose descender is positive.
 	ShaperRule VerticalRule = iota
 	// MicrosoftRule takes the typographic values when the font asks for
 	// them, the Windows ones otherwise, and the hhea ones when OS/2 has

@@ -13,6 +13,11 @@ type Positioned struct {
 	// XOffset and YOffset move the glyph from its place on the baseline,
 	// to the right and up, without moving the glyphs after it.
 	XOffset, YOffset float64
+	// Text is what the glyph stands for, when layout knows: the characters
+	// of its cluster, on the first glyph of the cluster. A ligature has
+	// several characters and no entry in the character map of its font;
+	// this is what lets its text be copied from a document.
+	Text string
 }
 
 // Run is a row of glyphs of one face at one size, laid out from left to
@@ -54,9 +59,12 @@ func (r *Run) Outline() Outline {
 	for i := range r.Glyphs {
 		g := &r.Glyphs[i]
 		if o, ok := FromFace(r.Face, g.ID, r.Size, style); ok {
-			// The slant leaves the baseline where it is: an offset above it
-			// moves the glyph as a whole, not along the shear.
-			dx, dy := x+g.XOffset, g.YOffset
+			// The run is slanted as a whole, offsets included: a glyph
+			// raised above the baseline moves to the right with what is at
+			// its height. A mark the font placed over a letter then stays
+			// over it, and a renderer that shears the whole line, as a PDF
+			// text matrix does, puts it at the same place.
+			dx, dy := x+g.XOffset+r.Slant*g.YOffset, g.YOffset
 			for j := range o {
 				for k := range o[j].Points() {
 					o[j].P[k].X += dx

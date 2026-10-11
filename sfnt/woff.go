@@ -96,7 +96,7 @@ func ParseWOFF(b []byte) ([]byte, error) {
 		compLength := r.ReadUint32()
 		origLength := r.ReadUint32()
 		origChecksum := r.ReadUint32()
-		if length-compLength < offset {
+		if length < compLength || length-compLength < offset {
 			return nil, fmt.Errorf("table extends beyond file size")
 		} else if origLength < compLength {
 			return nil, fmt.Errorf("compressed table size is larger than decompressed size")
@@ -174,7 +174,9 @@ func ParseWOFF(b []byte) ([]byte, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s: %v", table.tag, err)
 			}
-			if _, err = io.Copy(&buf, r); err != nil {
+			// read no more than the table says it holds, and one byte to
+			// tell a stream that holds more
+			if _, err = io.Copy(&buf, io.LimitReader(r, int64(table.origLength)+1)); err != nil {
 				return nil, fmt.Errorf("%s: %v", table.tag, err)
 			}
 			if err = r.Close(); err != nil {
